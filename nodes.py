@@ -382,8 +382,7 @@ def _process_frames_in_batches(pipe, _frames, original_frames, scale, color_fix,
             clean_vram()
         
         # Log the batch output size for debugging
-        pipeline_output_frames = batch_output.shape[0]
-        log(f"[FlashVSR] Batch {batch_idx + 1} produced {pipeline_output_frames} frames from {actual_batch_size} input frames", message_type='info')
+        log(f"[FlashVSR] Batch {batch_idx + 1} produced {batch_output.shape[0]} frames from {actual_batch_size} input frames", message_type='info')
         
         batch_outputs.append(batch_output)
         
@@ -446,10 +445,10 @@ def _process_frames_in_batches(pipe, _frames, original_frames, scale, color_fix,
     # Handle case where we have fewer frames than original due to alignment
     if output_frame_count < original_frame_count:
         log(f"[FlashVSR] Padding output from {output_frame_count} to {original_frame_count} frames", message_type='info')
-        # Pad with the last frame repeated
+        # Pad with the last frame expanded (memory efficient view)
         frames_needed = original_frame_count - output_frame_count
         last_frame = final_output[-1:, :, :, :]
-        padding = last_frame.repeat(frames_needed, 1, 1, 1)
+        padding = last_frame.expand(frames_needed, -1, -1, -1)
         final_output = torch.cat([final_output, padding], dim=0)
     else:
         # Trim to original count if we have more frames
