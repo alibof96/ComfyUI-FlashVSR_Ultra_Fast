@@ -382,19 +382,19 @@ def _process_frames_in_batches(pipe, _frames, original_frames, scale, color_fix,
     if len(batch_outputs) == 1:
         final_output = batch_outputs[0]
     else:
-        # Start with first batch - convert to list of individual frames
-        merged_frames = [batch_outputs[0][i, :, :, :] for i in range(batch_outputs[0].shape[0])]
+        # Start with first batch - convert to list of individual frames using torch.unbind for efficiency
+        merged_frames = list(torch.unbind(batch_outputs[0], dim=0))
         
         for i in range(1, len(batch_outputs)):
             current_batch = batch_outputs[i]
             
             # Blend overlapping frames
-            if frame_overlap > 0 and merged_frames:
-                # Get the last frame_overlap frames from merged output
-                prev_batch_last_frames = torch.stack(merged_frames[-frame_overlap:], dim=0)
+            if frame_overlap > 0 and len(merged_frames) >= frame_overlap:
+                # Get the last frame_overlap frames from merged output (already as separate tensors)
+                prev_batch_last_frames = merged_frames[-frame_overlap:]
                 
                 # Get the first frame_overlap frames from current batch
-                curr_batch_first_frames = current_batch[:frame_overlap, :, :, :]
+                curr_batch_first_frames = list(torch.unbind(current_batch[:frame_overlap, :, :, :], dim=0))
                 
                 # Blend overlapping frames with gradual transition
                 blended_frames = []
@@ -411,11 +411,11 @@ def _process_frames_in_batches(pipe, _frames, original_frames, scale, color_fix,
                 # Replace last frame_overlap frames in merged output with blended ones
                 merged_frames = merged_frames[:-frame_overlap] + blended_frames
                 
-                # Add remaining frames from current batch (skip overlapped ones)
-                merged_frames.extend([current_batch[j, :, :, :] for j in range(frame_overlap, current_batch.shape[0])])
+                # Add remaining frames from current batch (skip overlapped ones) using torch.unbind
+                merged_frames.extend(list(torch.unbind(current_batch[frame_overlap:, :, :, :], dim=0)))
             else:
-                # No overlap, just append
-                merged_frames.extend([current_batch[j, :, :, :] for j in range(current_batch.shape[0])])
+                # No overlap, just append using torch.unbind for efficiency
+                merged_frames.extend(list(torch.unbind(current_batch, dim=0)))
         
         # Stack all frames
         final_output = torch.stack(merged_frames, dim=0)
