@@ -382,8 +382,8 @@ def _process_frames_in_batches(pipe, _frames, original_frames, scale, color_fix,
     if len(batch_outputs) == 1:
         final_output = batch_outputs[0]
     else:
-        # Start with first batch
-        merged_frames = [batch_outputs[0]]
+        # Start with first batch - convert to list of individual frames
+        merged_frames = [batch_outputs[0][i, :, :, :] for i in range(batch_outputs[0].shape[0])]
         
         for i in range(1, len(batch_outputs)):
             current_batch = batch_outputs[i]
@@ -391,7 +391,7 @@ def _process_frames_in_batches(pipe, _frames, original_frames, scale, color_fix,
             # Blend overlapping frames
             if frame_overlap > 0 and merged_frames:
                 # Get the last frame_overlap frames from merged output
-                prev_batch_last_frames = torch.cat([f.unsqueeze(0) for f in merged_frames[-frame_overlap:]], dim=0)
+                prev_batch_last_frames = torch.stack(merged_frames[-frame_overlap:], dim=0)
                 
                 # Get the first frame_overlap frames from current batch
                 curr_batch_first_frames = current_batch[:frame_overlap, :, :, :]
@@ -686,13 +686,13 @@ class FlashVSRNodeAdv:
                     "default": 1,
                     "min": 1,
                     "max": 1000,
-                    "tooltip": "Number of frames to process per batch. Set to 1 to process all frames at once (default). Higher values enable batch processing for faster inference."
+                    "tooltip": "Number of frames to process per batch. Default 1 disables batch processing (processes all frames together). Set higher (e.g., 30-50) to enable batch processing for faster inference on long videos."
                 }),
                 "frame_overlap": ("INT", {
                     "default": 2,
                     "min": 0,
                     "max": 10,
-                    "tooltip": "Number of frames to overlap between batches for temporal consistency. Recommended: 2-4 frames. Set to 0 to disable overlap."
+                    "tooltip": "Number of frames to overlap between batches for temporal consistency. Recommended: 2-4 frames. Set to 0 to disable overlap. Only used when batch_size > 1."
                 }),
             }
         }
@@ -746,13 +746,13 @@ class FlashVSRNode:
                     "default": 1,
                     "min": 1,
                     "max": 1000,
-                    "tooltip": "Number of frames to process per batch. Set to 1 to process all frames at once (default). Higher values enable batch processing for faster inference."
+                    "tooltip": "Number of frames to process per batch. Default 1 disables batch processing (processes all frames together). Set higher (e.g., 30-50) to enable batch processing for faster inference on long videos."
                 }),
                 "frame_overlap": ("INT", {
                     "default": 2,
                     "min": 0,
                     "max": 10,
-                    "tooltip": "Number of frames to overlap between batches for temporal consistency. Recommended: 2-4 frames. Set to 0 to disable overlap."
+                    "tooltip": "Number of frames to overlap between batches for temporal consistency. Recommended: 2-4 frames. Set to 0 to disable overlap. Only used when batch_size > 1."
                 }),
             }
         }
