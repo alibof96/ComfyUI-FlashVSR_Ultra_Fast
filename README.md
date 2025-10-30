@@ -3,6 +3,12 @@ Running FlashVSR on lower VRAM without any artifacts.
 **[[📃中文版本](./README_zh.md)]**
 
 ## Changelog
+#### 2025-10-30
+- Added batch processing with configurable `batch_size` and `frame_overlap` parameters.
+- Implemented temporal consistency with frame overlap blending for smoother transitions.
+- Added integrity checks to ensure output frame count matches input.
+- Improved performance with optimized tensor operations.
+
 #### 2025-10-24
 - Added long video pipeline that significantly reduces VRAM usage when upscaling long videos.
 
@@ -30,7 +36,11 @@ Significantly reduces VRAM usage at the cost of speed.
 - **tile\_size, tile\_overlap**:  
 How to split the input video.  
 - **unload_dit:**  
-Unload DiT before decoding to reduce VRAM peak at the cost of speed.  
+Unload DiT before decoding to reduce VRAM peak at the cost of speed.
+- **batch_size:**  
+Number of frames to process per batch. Default `1` disables batch processing (processes all frames together). Set higher (e.g., `30-50`) to enable batch processing for faster inference on long videos. Only applies when processing more frames than the batch size.
+- **frame_overlap:**  
+Number of frames to overlap between batches for temporal consistency. Recommended: `2-4` frames. Set to `0` to disable overlap. This helps maintain smooth transitions between batches by blending overlapping frames. Only used when `batch_size > 1`.  
 
 ## Installation
 
