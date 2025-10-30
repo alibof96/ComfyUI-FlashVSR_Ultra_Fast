@@ -251,16 +251,221 @@ class cqdm:
     def __len__(self):
         return self.total
 
-def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload):
+def _blend_overlapping_frames(frame1, frame2, alpha=0.5):
+    """
+    Blend two overlapping frames using weighted averaging.
+    
+    Args:
+        frame1: First frame tensor
+        frame2: Second frame tensor
+        alpha: Blending factor (0.5 = equal weight)
+    
+    Returns:
+        Blended frame tensor
+    """
+    return frame1 * alpha + frame2 * (1.0 - alpha)
+
+def _process_frames_in_batches(pipe, _frames, original_frames, scale, color_fix, tiled_vae, 
+                                tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, 
+                                kv_ratio, local_range, seed, force_offload, batch_size, 
+                                frame_overlap, original_frame_count):
+    """
+    Process frames in batches with overlapping frames for temporal consistency.
+    
+    Args:
+        batch_size: Number of frames per batch
+        frame_overlap: Number of frames to overlap between consecutive batches
+    
+    Returns:
+        Processed frames tensor with original frame count maintained
+    """
+    _device = pipe.device
+    dtype = pipe.torch_dtype
+    
+    total_frames = _frames.shape[0]
+    log(f"[FlashVSR] Processing {total_frames} frames in batches of {batch_size} with {frame_overlap} frame overlap", message_type='info')
+    
+    # Calculate batch boundaries
+    batch_outputs = []
+    batch_start = 0
+    batch_idx = 0
+    
+    while batch_start < total_frames:
+        # Determine batch end
+        batch_end = min(batch_start + batch_size, total_frames)
+        actual_batch_size = batch_end - batch_start
+        
+        log(f"[FlashVSR] Processing batch {batch_idx + 1}: frames {batch_start} to {batch_end} (size: {actual_batch_size})", message_type='info')
+        
+        # Extract batch frames
+        batch_frames = _frames[batch_start:batch_end, :, :, :]
+        
+        # Process this batch
+        if tiled_dit:
+            N, H, W, C = batch_frames.shape
+            num_aligned_frames = largest_8n1_leq(N + 4) - 4
+            
+            final_output_canvas = torch.zeros(
+                (num_aligned_frames, H * scale, W * scale, C), 
+                dtype=dtype, 
+                device="cpu"
+            )
+            weight_sum_canvas = torch.zeros_like(final_output_canvas)
+            tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
+            
+            for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc=f"Processing Batch {batch_idx + 1} Tiles")):
+                input_tile = batch_frames[:, y1:y2, x1:x2, :]
+                
+                LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
+                if not isinstance(pipe, FlashVSRTinyLongPipeline):
+                    LQ_tile = LQ_tile.to(_device)
+                    
+                output_tile_gpu = pipe(
+                    prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
+                    LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+                    topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
+                    color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload
+                )
+                
+                processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
+                
+                mask_nchw = create_feather_mask(
+                    (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
+                    tile_overlap * scale
+                ).to("cpu")
+                mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
+                out_x1, out_y1 = x1 * scale, y1 * scale
+                
+                tile_H_scaled = processed_tile_cpu.shape[1]
+                tile_W_scaled = processed_tile_cpu.shape[2]
+                out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
+                final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu * mask_nhwc
+                weight_sum_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
+                
+                del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
+                clean_vram()
+                
+            weight_sum_canvas[weight_sum_canvas == 0] = 1.0
+            batch_output = final_output_canvas / weight_sum_canvas
+        else:
+            LQ, th, tw, F = prepare_input_tensor(batch_frames, _device, scale=scale, dtype=dtype)
+            if not isinstance(pipe, FlashVSRTinyLongPipeline):
+                LQ = LQ.to(_device)
+            
+            video = pipe(
+                prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
+                progress_bar_cmd=cqdm, LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+                topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
+                color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload
+            )
+            
+            batch_output = tensor2video(video).to('cpu')
+            
+            del video, LQ
+            clean_vram()
+        
+        # Trim to actual batch size processed
+        batch_output = batch_output[:actual_batch_size, :, :, :]
+        batch_outputs.append(batch_output)
+        
+        # Move to next batch, accounting for overlap
+        if batch_end < total_frames:
+            batch_start = batch_end - frame_overlap
+        else:
+            batch_start = batch_end
+        
+        batch_idx += 1
+    
+    # Merge batches with blending for overlapping regions
+    log(f"[FlashVSR] Merging {len(batch_outputs)} batches with overlap blending", message_type='info')
+    
+    if len(batch_outputs) == 1:
+        final_output = batch_outputs[0]
+    else:
+        # Start with first batch
+        merged_frames = [batch_outputs[0]]
+        
+        for i in range(1, len(batch_outputs)):
+            current_batch = batch_outputs[i]
+            
+            # Blend overlapping frames
+            if frame_overlap > 0 and merged_frames:
+                # Get the last frame_overlap frames from merged output
+                prev_batch_last_frames = torch.cat([f.unsqueeze(0) for f in merged_frames[-frame_overlap:]], dim=0)
+                
+                # Get the first frame_overlap frames from current batch
+                curr_batch_first_frames = current_batch[:frame_overlap, :, :, :]
+                
+                # Blend overlapping frames with gradual transition
+                blended_frames = []
+                for j in range(frame_overlap):
+                    # Gradually transition from previous to current batch
+                    alpha = (j + 1) / (frame_overlap + 1)
+                    blended = _blend_overlapping_frames(
+                        prev_batch_last_frames[j], 
+                        curr_batch_first_frames[j], 
+                        alpha=alpha
+                    )
+                    blended_frames.append(blended)
+                
+                # Replace last frame_overlap frames in merged output with blended ones
+                merged_frames = merged_frames[:-frame_overlap] + blended_frames
+                
+                # Add remaining frames from current batch (skip overlapped ones)
+                merged_frames.extend([current_batch[j, :, :, :] for j in range(frame_overlap, current_batch.shape[0])])
+            else:
+                # No overlap, just append
+                merged_frames.extend([current_batch[j, :, :, :] for j in range(current_batch.shape[0])])
+        
+        # Stack all frames
+        final_output = torch.stack(merged_frames, dim=0)
+    
+    # Integrity check: ensure output frame count matches
+    output_frame_count = final_output.shape[0]
+    log(f"[FlashVSR] Frame count after batch processing: {output_frame_count}", message_type='info')
+    
+    # Return only the original number of frames requested
+    final_output = final_output[:original_frame_count, :, :, :]
+    
+    # Final integrity check
+    if final_output.shape[0] != original_frame_count:
+        log(f"[FlashVSR] WARNING: Output frame count ({final_output.shape[0]}) != input frame count ({original_frame_count})", message_type='warning')
+    else:
+        log(f"[FlashVSR] Integrity check passed: {final_output.shape[0]} frames", message_type='finish')
+    
+    log("[FlashVSR] Batch processing complete.", message_type='finish')
+    return final_output
+
+def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, batch_size=1, frame_overlap=2):
+    """
+    Process video frames with optional batch processing and temporal overlap.
+    
+    Args:
+        batch_size: Number of frames to process in each batch (default: 1, means process all at once)
+        frame_overlap: Number of frames to overlap between batches for temporal consistency (default: 2)
+    """
     _frames = frames
     _device = pipe.device
     dtype = pipe.torch_dtype
+    
+    original_frame_count = frames.shape[0]
+    log(f"[FlashVSR] Input frame count: {original_frame_count}", message_type='info')
 
     if frames.shape[0] < 21:
         add = 21 - frames.shape[0]
         last_frame = frames[-1:, :, :, :]
         padding_frames = last_frame.repeat(add, 1, 1, 1)
         _frames = torch.cat([frames, padding_frames], dim=0)
+    
+    # Check if batch processing is requested (batch_size > 1 means process in batches)
+    if batch_size > 1 and _frames.shape[0] > batch_size:
+        log(f"[FlashVSR] Batch processing enabled: batch_size={batch_size}, overlap={frame_overlap}", message_type='info')
+        return _process_frames_in_batches(
+            pipe, _frames, frames, scale, color_fix, tiled_vae, tiled_dit, 
+            tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, 
+            local_range, seed, force_offload, batch_size, frame_overlap,
+            original_frame_count
+        )
         
     if tiled_dit:
         N, H, W, C = _frames.shape
@@ -477,6 +682,18 @@ class FlashVSRNodeAdv:
                     "min": 0,
                     "max": 1125899906842624
                 }),
+                "batch_size": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 1000,
+                    "tooltip": "Number of frames to process per batch. Set to 1 to process all frames at once (default). Higher values enable batch processing for faster inference."
+                }),
+                "frame_overlap": ("INT", {
+                    "default": 2,
+                    "min": 0,
+                    "max": 10,
+                    "tooltip": "Number of frames to overlap between batches for temporal consistency. Recommended: 2-4 frames. Set to 0 to disable overlap."
+                }),
             }
         }
     
@@ -486,9 +703,9 @@ class FlashVSRNodeAdv:
     CATEGORY = "FlashVSR"
     #DESCRIPTION = ""
     
-    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed):
+    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, batch_size, frame_overlap):
         _pipe, force_offload = pipe
-        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload)
+        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, batch_size, frame_overlap)
         return(output,)
 
 class FlashVSRNode:
@@ -525,6 +742,18 @@ class FlashVSRNode:
                     "min": 0,
                     "max": 1125899906842624
                 }),
+                "batch_size": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 1000,
+                    "tooltip": "Number of frames to process per batch. Set to 1 to process all frames at once (default). Higher values enable batch processing for faster inference."
+                }),
+                "frame_overlap": ("INT", {
+                    "default": 2,
+                    "min": 0,
+                    "max": 10,
+                    "tooltip": "Number of frames to overlap between batches for temporal consistency. Recommended: 2-4 frames. Set to 0 to disable overlap."
+                }),
             }
         }
     
@@ -534,14 +763,14 @@ class FlashVSRNode:
     CATEGORY = "FlashVSR"
     DESCRIPTION = 'Download the entire "FlashVSR" folder with all the files inside it from "https://huggingface.co/JunhaoZhuang/FlashVSR" and put it in the "ComfyUI/models"'
     
-    def main(self, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed):
+    def main(self, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed, batch_size, frame_overlap):
         wan_video_dit.USE_BLOCK_ATTN = False
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "auto"
         if _device == "auto" or _device not in device_choices:
             raise RuntimeError("No devices found to run FlashVSR!")
             
         pipe = init_pipeline(mode, _device, torch.float16)
-        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, True)
+        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, True, batch_size, frame_overlap)
         return(output,)
 
 NODE_CLASS_MAPPINGS = {
