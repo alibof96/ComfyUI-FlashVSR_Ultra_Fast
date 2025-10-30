@@ -282,6 +282,9 @@ def _process_frames_in_batches(pipe, _frames, original_frames, scale, color_fix,
     _device = pipe.device
     dtype = pipe.torch_dtype
     
+    # Minimum frames required for processing (pipeline needs at least 21 frames)
+    MIN_BATCH_FRAMES = 21
+    
     total_frames = _frames.shape[0]
     log(f"[FlashVSR] Processing {total_frames} frames in batches of {batch_size} with {frame_overlap} frame overlap", message_type='info')
     
@@ -294,6 +297,20 @@ def _process_frames_in_batches(pipe, _frames, original_frames, scale, color_fix,
         # Determine batch end
         batch_end = min(batch_start + batch_size, total_frames)
         actual_batch_size = batch_end - batch_start
+        
+        # Check if this would be the last batch and if it's too small
+        # If so, extend it to include more frames from the previous batch region
+        remaining_frames = total_frames - batch_end
+        if remaining_frames > 0 and remaining_frames < MIN_BATCH_FRAMES:
+            # Extend current batch to include the remaining frames
+            batch_end = total_frames
+            actual_batch_size = batch_end - batch_start
+            log(f"[FlashVSR] Extended batch to include remaining {remaining_frames} frames (would be too small)", message_type='info')
+        elif actual_batch_size < MIN_BATCH_FRAMES and batch_start > 0:
+            # Current batch is too small, extend it backwards
+            batch_start = max(0, batch_end - MIN_BATCH_FRAMES)
+            actual_batch_size = batch_end - batch_start
+            log(f"[FlashVSR] Extended batch backwards to meet minimum frame requirement", message_type='info')
         
         log(f"[FlashVSR] Processing batch {batch_idx + 1}: frames {batch_start} to {batch_end} (size: {actual_batch_size})", message_type='info')
         
